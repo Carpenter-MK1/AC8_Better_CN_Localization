@@ -1,0 +1,18 @@
+{
+  "version": "2026.10.11.1",
+  "tag": "v2026.10.11.1",
+  "released_at": "2026-10-11T07:05:05Z",
+  "notes": "管理器 1.3：新增「检查更新」\n- 一键把译文包与代理 DLL 更新到最新版；启动时也会自动检查一次，只有发现新版才提示\n- 下载后校验大小与 sha256，全部通过才替换；中途失败不动任何现有文件\n- 状态区新增「资源版本」，显示当前 payload 实际装的是哪一版\n- 更新清单改用 dist/version.json（取代原来的 version.txt）",
+  "files": [
+    {
+      "name": "pakchunk0-Windows_998_P.pak",
+      "size": 574498,
+      "sha256": "aef0bd3765e87b56d9b668639c8143ac9438e1337497b81a51e45b7fb063f566"
+    },
+    {
+      "name": "dinput8.dll",
+      "size": 8192,
+      "sha256": "8d56aef1b6f2da1c537f8ee61019730ad46d60f3fed043dc760cc32fa9acfdfa"
+    }
+  ]
+}

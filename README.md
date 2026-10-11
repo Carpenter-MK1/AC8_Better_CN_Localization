@@ -15,7 +15,8 @@
 | **状态自检** | 汉化包（含**构建时间**）、代理 DLL、游戏版本是否适配、上次运行有没有加载成功 |
 | **启动游戏** | 走 Steam 启动，无需额外参数 |
 | **首次使用须知** | 免责声明 + 多人模式警告，必须停留 3 秒才能确认 |
-| **命令行** | `status` / `enable` / `disable` / `launch`，便于脚本化（`status` 就绪时退出码 0） |
+| **检查更新** | 一键把译文包与代理 DLL 更新到最新版：读仓库里的 `dist/version.json`，下载后校验 **大小 + sha256**，全部通过才替换。**启动时自动查一次**（只有发现新版才提示） |
+| **命令行** | `status` / `enable` / `disable` / `launch` / `check` / `update`，便于脚本化（`status` 就绪时退出码 0） |
 
 界面上的「汉化包 构建于 …」取自译文包**自身的文件时间戳**，所以它反映的是**实际装着的那一版**的构建时间。
 
@@ -55,7 +56,7 @@ https://ghfast.top/https://github.com/Carpenter-MK1/AC8_Better_CN_Localization/r
 |---|---|
 | 译文包 | `https://cdn.jsdelivr.net/gh/Carpenter-MK1/AC8_Better_CN_Localization@main/dist/pakchunk0-Windows_998_P.pak` |
 | 代理 DLL | `https://cdn.jsdelivr.net/gh/Carpenter-MK1/AC8_Better_CN_Localization@main/dist/dinput8.dll` |
-| 版本信息 | `https://cdn.jsdelivr.net/gh/Carpenter-MK1/AC8_Better_CN_Localization@main/dist/version.txt` |
+| 更新清单 | `https://cdn.jsdelivr.net/gh/Carpenter-MK1/AC8_Better_CN_Localization@main/dist/version.json` |
 
 下载后放进管理器的 `payload\` 目录（**文件名保持不变**），再点「启用汉化」即可。
 
@@ -105,10 +106,10 @@ zig cc -o _test_match.exe _test_match.c && ./_test_match.exe
 ## 目录结构
 
 ```
-├── dist/            译文包与代理 DLL（供下载；后续「检查更新」也读这里）
+├── dist/            译文包、代理 DLL、更新清单（管理器「检查更新」读这里）
 │   ├── pakchunk0-Windows_998_P.pak
 │   ├── dinput8.dll
-│   └── version.txt  版本号 + 本次更新说明
+│   └── version.json 版本 / 更新时间 / 更新说明 / 每个文件的大小与 sha256
 ├── src/
 │   ├── gui/          管理器（Win32 GUI，单文件 C）
 │   │   ├── main.c
