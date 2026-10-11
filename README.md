@@ -63,6 +63,35 @@ https://ghfast.top/https://github.com/Carpenter-MK1/AC8_Better_CN_Localization/r
 > ⚠️ `ghfast.top`、`gh-proxy.com` 等是**第三方转发服务**，可用性与安全性均不由本项目保证。
 > 有条件时建议直连 GitHub 官方地址。
 
+## 更新清单（`dist/version.json`）
+
+管理器 1.3 起用这份清单做「检查更新」—— 它既是**远程清单**，也是 payload 里的**本地版本标记**：
+
+```json
+{
+  "version": "2026.10.11.1",
+  "tag": "v2026.10.11.1",
+  "released_at": "2026-10-11T07:05:05Z",
+  "notes": "更新说明（纯文本，可含换行）",
+  "files": [
+    { "name": "pakchunk0-Windows_998_P.pak", "size": 574498, "sha256": "…" },
+    { "name": "dinput8.dll",                 "size": 8192,   "sha256": "…" }
+  ]
+}
+```
+
+流程（实现在 `src/gui/main.c`）：
+
+1. 取清单：`raw.githubusercontent.com/<user>/<repo>/main/dist/version.json`
+   失败依次退到 `gcore.jsdelivr.net` / `cdn.jsdelivr.net`（jsDelivr 的 gh 通道）/ `api.github.com` 的 releases/latest
+2. 与 `payload\version.json` 的 `version` 比对，相同即「已最新」
+3. 有新版 → 从 `…/<tag>/dist/<文件>` 下载（用 tag 锁定，避免 main 漂移）
+4. 校验 **size + sha256**，全部通过才替换 `payload\`
+5. 若汉化已启用，同时更新游戏目录里的文件（旧文件备份到 `_backup\`）
+
+> 中途任何一步失败都**不动现有文件**。管理器**启动时**会自动查一次（只有发现新版才提示），
+> 也可以随时点【检查更新】。命令行等价物：`AC8汉化管理器.exe check` / `AC8汉化管理器.exe update`。
+
 ## 从源码构建
 
 ### 前置

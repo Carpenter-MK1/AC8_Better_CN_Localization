@@ -9,19 +9,24 @@
  *    ③ 按需启动游戏（走 Steam，实测不带任何参数也能加载汉化）
  *    ④ 状态自检：汉化包（含构建时间）、代理 DLL、游戏版本适配、上次运行加载情况
  *    ⑤ 首次「启用汉化」弹「使用前须知」：免责声明 + 多人模式封号警告（红字），须停留 3 秒才可确认
+ *    ⑥ 检查更新：读仓库里的 dist/version.json，比对后下载并校验（size + sha256）
+ *       新的「汉化包 + 注入包」；启动时自动查一次（静默，只有发现新版才提示）
  *
  *  也支持命令行（脚本/自动化友好）：
- *    AC8汉化管理器.exe status | enable | disable | launch | help
+ *    AC8汉化管理器.exe status | enable | disable | launch | check | update | help
  *    status 退出码：0 = 完全就绪，1 = 未装好或有问题
  * ============================================================================= */
 
 #define UNICODE
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
+#define _WIN32_WINNT 0x0601
 
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <winhttp.h>
+#include <wincrypt.h>
 #include <shlobj.h>
 #include <objbase.h>
 #include <stdarg.h>
@@ -30,7 +35,7 @@
 /* ------------------------------- 常量 ----------------------------------- */
 
 #define APP_TITLE    L"ACE COMBAT 8 · 简体汉化管理器"
-#define APP_VER      L"1.2"
+#define APP_VER      L"1.3"
 
 #define PAK_NAME     L"pakchunk0-Windows_998_P.pak"
 #define DLL_NAME     L"dinput8.dll"
@@ -57,6 +62,11 @@ static const char kDllMarker[] = "AC8CN-PROXY-DINPUT8-V3";
 #define IDC_LAUNCH    1022
 #define IDC_REFRESH   1023
 #define IDC_OPENFOLDER 1024
+#define IDC_UPDATE     1025
+
+#define WM_APP_UPDDONE    (WM_APP + 1)
+#define WM_APP_APPLYDONE  (WM_APP + 2)
+#define IDT_AUTOCHECK     3002
 
 /* ------------------------------- 全局 ----------------------------------- */
 
@@ -286,11 +296,15 @@ typedef struct {
     wchar_t dllPath[MAX_PATH * 2];
     BOOL dllOk;   unsigned long long dllSize;  BOOL dllOurs;
 
+    wchar_t payloadVer[64];     /* payload\version.json 里的资源版本 */
+
     BOOL fpRead;  DWORD ts, so;  BOOL fpOk;
 
     wchar_t logPath[MAX_PATH * 2];
     BOOL logOk;   BOOL logHit;
 } Status;
+
+static void upd_local_ver(wchar_t* out, int cap);   /* 实现在下方「更新模块」 */
 
 static void probe_status(Status* s, const wchar_t* gameRoot, const wchar_t* iniPath)
 {
@@ -311,6 +325,8 @@ static void probe_status(Status* s, const wchar_t* gameRoot, const wchar_t* iniP
     s->dllOk = fexists(s->dllPath);
     s->dllSize = s->dllOk ? fsize(s->dllPath) : 0;
     if (s->dllOk) s->dllOurs = file_has_marker(s->dllPath, kDllMarker);
+
+    upd_local_ver(s->payloadVer, 64);
 
     /* exe 版本指纹 */
     wsprintfW(exe, L"%s\\Game\\Binaries\\Win64\\AceCombat8.exe", s->gameRoot);
@@ -565,6 +581,33 @@ static void out_line(const wchar_t* s)
     WriteFile(g_out, "\r\n", 2, &w, NULL);
 }
 
+/* 把带 \r\n 的多行文本逐行输出 */
+static void out_multiline(const wchar_t* s)
+{
+    wchar_t buf[8192];
+    const wchar_t* p;
+    lstrcpynW(buf, s, 8192);
+    p = buf;
+    while (*p) {
+        wchar_t* nl = wcschr(p, L'\r');
+        if (nl) *nl = 0;
+        out_line(p);
+        if (!nl) break;
+        p = nl + 1;
+        while (*p == L'\n') ++p;
+    }
+}
+
+static void out_line2(const wchar_t* fmt, ...)
+{
+    wchar_t t[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    wvsprintfW(t, fmt, ap);
+    va_end(ap);
+    out_line(t);
+}
+
 static void status_text(const Status* s, wchar_t* out, int cap)
 {
     wchar_t num[32];
@@ -595,6 +638,9 @@ static void status_text(const Status* s, wchar_t* out, int cap)
     if (!s->dllOk)       ADD(L"代理 DLL   未安装\r\n");
     else if (s->dllOurs) ADD(L"代理 DLL   已安装   %s 字节\r\n", num);
     else                 ADD(L"代理 DLL   版本不符   %s 字节（不是本工具的 DLL）\r\n", num);
+
+    if (s->payloadVer[0]) ADD(L"资源版本   %s\r\n", s->payloadVer);
+    else                  ADD(L"资源版本   未知（payload 里缺 version.json）\r\n");
 
     if (!s->fpRead)      ADD(L"游戏版本   无法读取\r\n");
     else if (s->fpOk)    ADD(L"游戏版本   已适配\r\n");
@@ -627,7 +673,567 @@ static void cli_usage(void)
     out_line(L"  AC8汉化管理器.exe enable     启用汉化");
     out_line(L"  AC8汉化管理器.exe disable    停用汉化（恢复原版）");
     out_line(L"  AC8汉化管理器.exe launch     启动游戏");
+    out_line(L"  AC8汉化管理器.exe check      只检查有没有新版（0=已最新，3=有新版）");
+    out_line(L"  AC8汉化管理器.exe update     检查并下载更新汉化包与注入包");
     out_line(L"  AC8汉化管理器.exe help       显示本帮助");
+}
+
+/* ======================= 更新：汉化包 + 注入包 ========================== */
+/*
+ * 清单：仓库里的 dist/version.json
+ *       含 version / tag / released_at / notes / files[].name+size+sha256
+ *       本地就是 payload\version.json，读它的 version 当"当前版本"。
+ *
+ * 取清单：raw.githubusercontent.com/<o>/<r>/main/dist/version.json
+ *         退路 gcore.jsdelivr.net / cdn.jsdelivr.net（jsDelivr 的 gh 通道）
+ *         再退 api.github.com/repos/<o>/<r>/releases/latest（只有版本号，不能下载）
+ * 下载  ：raw.../<tag>/dist/<文件>，退路同上（用 tag 锁定，避免 main 漂移）
+ * 校验  ：size + sha256，全部通过才动 payload\
+ * 落地  ：先全下到 payload\_tmp\ 并逐个校验 → 再替换；中途失败不动任何现有文件
+ * 回滚  ：**不做**（老大 2026-10-11 明确）
+ */
+
+#define UPD_USERW  L"Carpenter-MK1"
+#define UPD_REPOW  L"AC8_Better_CN_Localization"
+#define UPD_MANIFW L"version.json"
+#define UPD_WAIT   9000
+#define UPD_MAXF   4
+#define UPD_NSRC   3
+
+#ifndef WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+#define WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY 4
+#endif
+#ifndef WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS
+#define WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS 2
+#endif
+
+typedef struct {
+    char  name[64];
+    unsigned long long size;
+    char  sha[80];
+} UpdFile;
+
+typedef struct {
+    char      localVer[64];      /* 本地 payload\version.json 的 version */
+    char      ver[64];           /* 远程 version */
+    char      notes[2048];       /* 远程更新说明 */
+    wchar_t   tag[80];           /* 下载用的 git tag，如 v2026.10.11 */
+    BOOL      haveRemote;
+    int       nf;                /* files[] 条数；0 = 走 API 退路，拿不到文件信息 */
+    UpdFile   f[UPD_MAXF];
+    char      raw[8192];         /* 远程清单原文，落地时写进 payload\version.json */
+    int       rawLen;
+} UpdInfo;
+
+static void werr(wchar_t* out, int cap, const wchar_t* fmt, ...)
+{
+    va_list ap;
+    if (!out || cap <= 0) return;
+    va_start(ap, fmt);
+    wvsprintfW(out, fmt, ap);
+    va_end(ap);
+}
+
+/* ------------------------------ HTTP GET -------------------------------- */
+
+/* 一次 GET。hFile 有效 → 写入文件；否则写进 mem（memCap 含结尾 0）。 */
+static BOOL http_get(const wchar_t* url, char* mem, int memCap, int* memLen,
+                     HANDLE hFile, wchar_t* errMsg, int errCap)
+{
+    URL_COMPONENTS uc;
+    wchar_t host[256], path[4096];
+    HINTERNET hs = NULL, hc = NULL, hr = NULL;
+    BOOL ok = FALSE;
+    DWORD status = 0, sz = 0;
+    DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+
+    if (errMsg && errCap) errMsg[0] = 0;
+    if (mem && memCap > 0) { mem[0] = 0; if (memLen) *memLen = 0; }
+
+    ZeroMemory(&uc, sizeof(uc));
+    uc.dwStructSize = sizeof(uc);
+    uc.lpszHostName = host; uc.dwHostNameLength = 256;
+    uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 4096;
+    if (!WinHttpCrackUrl(url, 0, 0, &uc)) { werr(errMsg, errCap, L"地址无法解析"); return FALSE; }
+
+    hs = WinHttpOpen(L"AC8CNManager/" APP_VER, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hs)
+        hs = WinHttpOpen(L"AC8CNManager/" APP_VER, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hs) { werr(errMsg, errCap, L"网络组件初始化失败"); return FALSE; }
+
+    WinHttpSetTimeouts(hs, UPD_WAIT, UPD_WAIT, UPD_WAIT, UPD_WAIT * 3);
+
+    hc = WinHttpConnect(hs, host, uc.nPort, 0);
+    if (!hc) { werr(errMsg, errCap, L"连不上 %s", host); goto done; }
+
+    hr = WinHttpOpenRequest(hc, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                            WINHTTP_DEFAULT_ACCEPT_TYPES,
+                            (uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0)
+                            | WINHTTP_FLAG_REFRESH);
+    if (!hr) { werr(errMsg, errCap, L"无法建立请求"); goto done; }
+
+    WinHttpSetOption(hr, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
+    WinHttpAddRequestHeaders(hr, L"Accept: */*", (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+
+    if (!WinHttpSendRequest(hr, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0)) {
+        werr(errMsg, errCap, L"发送请求失败（%u）", (unsigned)GetLastError()); goto done;
+    }
+    if (!WinHttpReceiveResponse(hr, NULL)) {
+        werr(errMsg, errCap, L"接收响应失败（%u）", (unsigned)GetLastError()); goto done;
+    }
+
+    sz = sizeof(status);
+    if (!WinHttpQueryHeaders(hr, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX)) {
+        werr(errMsg, errCap, L"读不到响应状态"); goto done;
+    }
+    if (status != 200) { werr(errMsg, errCap, L"服务器返回 HTTP %u", (unsigned)status); goto done; }
+
+    {
+        static char chunk[32 * 1024];
+        for (;;) {
+            DWORD avail = 0, got = 0, want;
+            if (!WinHttpQueryDataAvailable(hr, &avail)) { werr(errMsg, errCap, L"读取数据失败"); goto done; }
+            if (!avail) break;
+            want = avail > (DWORD)sizeof(chunk) ? (DWORD)sizeof(chunk) : avail;
+            if (!WinHttpReadData(hr, chunk, want, &got)) { werr(errMsg, errCap, L"读取数据失败"); goto done; }
+            if (!got) break;
+            if (hFile != INVALID_HANDLE_VALUE && hFile != NULL) {
+                DWORD w = 0;
+                if (!WriteFile(hFile, chunk, got, &w, NULL) || w != got) {
+                    werr(errMsg, errCap, L"写文件失败（%u）", (unsigned)GetLastError()); goto done;
+                }
+            } else if (mem && memLen) {
+                int room = memCap - 1 - *memLen;
+                int n = (int)got > room ? room : (int)got;
+                if (n > 0) { memcpy(mem + *memLen, chunk, (size_t)n); *memLen += n; mem[*memLen] = 0; }
+            }
+        }
+    }
+    ok = TRUE;
+
+done:
+    if (hr) WinHttpCloseHandle(hr);
+    if (hc) WinHttpCloseHandle(hc);
+    if (hs) WinHttpCloseHandle(hs);
+    return ok;
+}
+
+/* ------------------------------ 迷你 JSON ------------------------------- */
+
+/* 反转义：\n \r \t \" \\ \/  ；\uXXXX 粗略跳过 */
+static void j_unesc(const char* s, int len, char* out, int cap)
+{
+    int i = 0, o = 0;
+    for (i = 0; i < len && o < cap - 1; ++i) {
+        char c = s[i];
+        if (c == '\\' && i + 1 < len) {
+            char e = s[++i];
+            if (e == 'n') c = '\n';
+            else if (e == 'r') c = '\r';
+            else if (e == 't') c = '\t';
+            else if (e == 'u') { if (i + 4 < len) i += 4; c = '?'; }
+            else c = e;
+        }
+        out[o++] = c;
+    }
+    out[o] = 0;
+}
+
+/* 找 "key" 后面跟 : 的位置，返回值的起点（跳过空白），-1 表示没有 */
+static int j_find(const char* s, int len, const char* key, int* isStr)
+{
+    char pat[64];
+    int pl, i;
+    wsprintfA(pat, "\"%s\"", key);
+    pl = (int)strlen(pat);
+    if (len < pl) return -1;
+    for (i = 0; i + pl <= len; ++i) {
+        int k;
+        if (memcmp(s + i, pat, (size_t)pl) != 0) continue;
+        k = i + pl;
+        while (k < len && (s[k] == ' ' || s[k] == '\t' || s[k] == '\n' || s[k] == '\r')) ++k;
+        if (k >= len || s[k] != ':') continue;
+        ++k;
+        while (k < len && (s[k] == ' ' || s[k] == '\t' || s[k] == '\n' || s[k] == '\r')) ++k;
+        if (k >= len) return -1;
+        *isStr = (s[k] == '"');
+        return k;
+    }
+    return -1;
+}
+
+static BOOL jget_s(const char* s, int len, const char* key, char* out, int cap)
+{
+    int isStr = 0, k = j_find(s, len, key, &isStr), e;
+    if (k < 0 || !isStr) { out[0] = 0; return FALSE; }
+    ++k;
+    e = k;
+    while (e < len && s[e] != '"') {
+        if (s[e] == '\\') ++e;
+        ++e;
+    }
+    if (e > len) e = len;
+    j_unesc(s + k, e - k, out, cap);
+    return TRUE;
+}
+
+static BOOL jget_u(const char* s, int len, const char* key, unsigned long long* out)
+{
+    int isStr = 0, k = j_find(s, len, key, &isStr);
+    unsigned long long v = 0;
+    if (k < 0 || isStr) return FALSE;
+    while (k < len && s[k] >= '0' && s[k] <= '9') { v = v * 10 + (unsigned)(s[k] - '0'); ++k; }
+    *out = v;
+    return TRUE;
+}
+
+/* ------------------------------ SHA-256 --------------------------------- */
+
+static BOOL sha256_file(const wchar_t* path, char* hex /*>=65*/)
+{
+    static unsigned char buf[64 * 1024];
+    HANDLE h;
+    HCRYPTPROV prov = 0;
+    HCRYPTHASH hash = 0;
+    BOOL ok = FALSE;
+
+    hex[0] = 0;
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+
+    if (!CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) goto done;
+    if (!CryptCreateHash(prov, CALG_SHA_256, 0, 0, &hash)) goto done;
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(h, buf, (DWORD)sizeof(buf), &got, NULL)) goto done;
+        if (!got) break;
+        if (!CryptHashData(hash, buf, got, 0)) goto done;
+    }
+    {
+        BYTE d[32];
+        DWORD n = (DWORD)sizeof(d), i;
+        if (!CryptGetHashParam(hash, HP_HASHVAL, d, &n, 0)) goto done;
+        for (i = 0; i < n; ++i) wsprintfA(hex + i * 2, "%02x", d[i]);
+        hex[n * 2] = 0;
+    }
+    ok = TRUE;
+
+done:
+    if (hash) CryptDestroyHash(hash);
+    if (prov) CryptReleaseContext(prov, 0);
+    CloseHandle(h);
+    return ok;
+}
+
+/* ------------------------------ 版本读写 -------------------------------- */
+
+/* 本地版本：payload\version.json 的 version 字段。实现见前向声明。 */
+static void upd_local_ver(wchar_t* out, int cap)
+{
+    static char buf[8192];
+    wchar_t p[MAX_PATH * 2];
+    int n;
+    char v[64];
+    out[0] = 0;
+    wsprintfW(p, L"%s\\%s", g_payloadDir, UPD_MANIFW);
+    n = read_head(p, buf, (int)sizeof(buf) - 1);
+    if (n <= 0) return;
+    buf[n] = 0;
+    if (jget_s(buf, n, "version", v, 64)) u8_to_w(v, -1, out, cap);
+}
+
+static void upd_local_read(UpdInfo* u)
+{
+    static char buf[8192];
+    wchar_t p[MAX_PATH * 2];
+    int n;
+    wsprintfW(p, L"%s\\%s", g_payloadDir, UPD_MANIFW);
+    n = read_head(p, buf, (int)sizeof(buf) - 1);
+    if (n <= 0) return;
+    buf[n] = 0;
+    jget_s(buf, n, "version", u->localVer, 64);
+}
+
+/* 解析 files[] 数组 */
+static void upd_parse_files(const char* js, int len, UpdInfo* u)
+{
+    int isStr = 0, k;
+    u->nf = 0;
+    k = j_find(js, len, "files", &isStr);
+    if (k < 0) return;
+    while (k < len && u->nf < UPD_MAXF) {
+        int a, b;
+        while (k < len && js[k] != '{') {
+            if (js[k] == ']') return;
+            ++k;
+        }
+        if (k >= len) return;
+        a = k;
+        b = k;
+        while (b < len && js[b] != '}') ++b;
+        if (b >= len) return;
+        {
+            UpdFile* f = &u->f[u->nf];
+            if (jget_s(js + a, b - a + 1, "name", f->name, 64) && f->name[0]) {
+                if (!jget_u(js + a, b - a + 1, "size", &f->size)) f->size = 0;
+                if (!jget_s(js + a, b - a + 1, "sha256", f->sha, 80)) f->sha[0] = 0;
+                ++u->nf;
+            }
+        }
+        k = b + 1;
+    }
+}
+
+/* 从一份清单 JSON 里取出版本等字段 */
+static BOOL upd_parse_manifest(const char* js, int len, UpdInfo* u)
+{
+    char tag[80];
+    if (!jget_s(js, len, "version", u->ver, 64) || !u->ver[0]) return FALSE;
+    if (!jget_s(js, len, "notes", u->notes, 2048)) u->notes[0] = 0;
+    if (!jget_s(js, len, "tag", tag, 80) || !tag[0])
+        wsprintfA(tag, "v%s", u->ver);
+    u8_to_w(tag, -1, u->tag, 80);
+    upd_parse_files(js, len, u);
+    if (len > (int)sizeof(u->raw) - 1) len = (int)sizeof(u->raw) - 1;
+    memcpy(u->raw, js, (size_t)len);
+    u->raw[u->rawLen = len] = 0;
+    return TRUE;
+}
+
+/* ------------------------------ 取远程清单 ------------------------------ */
+
+static BOOL upd_fetch_remote(UpdInfo* u, OpResult* log)
+{
+    static char js[64 * 1024];
+    int n = 0, i;
+    wchar_t err[256], tmp[300];
+    static const wchar_t* kMan[] = {
+        L"https://raw.githubusercontent.com/" UPD_USERW L"/" UPD_REPOW L"/main/dist/" UPD_MANIFW,
+        L"https://gcore.jsdelivr.net/gh/" UPD_USERW L"/" UPD_REPOW L"@main/dist/" UPD_MANIFW,
+        L"https://cdn.jsdelivr.net/gh/" UPD_USERW L"/" UPD_REPOW L"@main/dist/" UPD_MANIFW,
+    };
+
+    for (i = 0; i < 3; ++i) {
+        if (!http_get(kMan[i], js, (int)sizeof(js), &n, INVALID_HANDLE_VALUE, err, 256) || n <= 0) {
+            werr(tmp, 300, L"%s", err);
+            op_append(log, L"  清单源 %d 失败：%s", i + 1, tmp);
+            continue;
+        }
+        if (upd_parse_manifest(js, n, u)) {
+            op_append(log, L"  清单源 %d：%s（%d 个文件）", i + 1, u->tag, u->nf);
+            u->haveRemote = TRUE;
+            return TRUE;
+        }
+        op_append(log, L"  清单源 %d 内容无法解析，换下一个", i + 1);
+    }
+
+    /* 退路：GitHub API —— 只能拿到版本号，下载不了（files 为空） */
+    {
+        wchar_t url[512];
+        wsprintfW(url, L"https://api.github.com/repos/%s/%s/releases/latest", UPD_USERW, UPD_REPOW);
+        if (http_get(url, js, (int)sizeof(js), &n, INVALID_HANDLE_VALUE, err, 256) && n > 0) {
+            char tag[80];
+            if (jget_s(js, n, "tag_name", tag, 80) && tag[0]) {
+                const char* q = tag;
+                if (*q == 'v' || *q == 'V') ++q;
+                lstrcpynA(u->ver, q, 64);
+                u8_to_w(tag, -1, u->tag, 80);
+                if (jget_s(js, n, "body", u->notes, 2048)) { /* 直接用 */ }
+                u->nf = 0;
+                op_append(log, L"  退路 GitHub API：%s（仅版本号，无法直接下载）", u->tag);
+                u->haveRemote = TRUE;
+                return TRUE;
+            }
+        }
+        werr(tmp, 300, L"%s", err);
+        op_append(log, L"  GitHub API 也失败：%s", tmp);
+    }
+    return FALSE;
+}
+
+/* 返回 0=检查失败 1=已最新 2=有新版 */
+static int upd_check(UpdInfo* u, OpResult* log)
+{
+    ZeroMemory(u, sizeof(*u));
+    ZeroMemory(log, sizeof(*log));
+    upd_local_read(u);
+    if (!upd_fetch_remote(u, log)) return 0;
+    if (!u->localVer[0]) return 2;
+    return (strcmp(u->localVer, u->ver) == 0) ? 1 : 2;
+}
+
+/* ------------------------------ 下载并校验 ------------------------------ */
+
+static void upd_build_url(const wchar_t* tag, const wchar_t* name, int src,
+                          wchar_t* out, int cap)
+{
+    static const wchar_t* kFmt[UPD_NSRC] = {
+        L"https://raw.githubusercontent.com/" UPD_USERW L"/" UPD_REPOW L"/%s/dist/%s",
+        L"https://gcore.jsdelivr.net/gh/" UPD_USERW L"/" UPD_REPOW L"@%s/dist/%s",
+        L"https://cdn.jsdelivr.net/gh/" UPD_USERW L"/" UPD_REPOW L"@%s/dist/%s",
+    };
+    if (src < 0 || src >= UPD_NSRC) src = 0;
+    (void)cap;
+    wsprintfW(out, kFmt[src], tag, name);
+}
+
+/* 下载到 dst 并校验 size + sha256 */
+static BOOL upd_get_one(const wchar_t* tag, const UpdFile* f, const wchar_t* dst,
+                        wchar_t* err, int errCap)
+{
+    wchar_t nameW[128], url[1024], e2[256];
+    int round, s;
+    char got[80];
+
+    u8_to_w(f->name, -1, nameW, 128);
+    for (round = 0; round < 2; ++round) {
+        for (s = 0; s < UPD_NSRC; ++s) {
+            /* tag 拿不到时退到 main（内容对不上会被 sha256 拦下） */
+            const wchar_t* tg = (round == 1) ? L"main" : tag;
+            HANDLE h;
+            upd_build_url(tg, nameW, s, url, 1024);
+            DeleteFileW(dst);
+            h = CreateFileW(dst, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h == INVALID_HANDLE_VALUE) {
+                werr(err, errCap, L"无法写入临时文件（%u）", (unsigned)GetLastError());
+                return FALSE;
+            }
+            if (!http_get(url, NULL, 0, NULL, h, e2, 256)) {
+                CloseHandle(h);
+                DeleteFileW(dst);
+                werr(err, errCap, L"源 %d：%s", s + 1, e2);
+                continue;
+            }
+            CloseHandle(h);
+            if (f->size && fsize(dst) != f->size) {
+                werr(err, errCap, L"源 %d：大小不符（%u != %u）", s + 1,
+                     (unsigned)fsize(dst), (unsigned)f->size);
+                DeleteFileW(dst);
+                continue;
+            }
+            if (f->sha[0]) {
+                if (!sha256_file(dst, got)) {
+                    werr(err, errCap, L"源 %d：无法计算哈希", s + 1);
+                    DeleteFileW(dst);
+                    continue;
+                }
+                if (lstrcmpiA(got, f->sha) != 0) {
+                    werr(err, errCap, L"源 %d：哈希不符", s + 1);
+                    DeleteFileW(dst);
+                    continue;
+                }
+            }
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* ------------------------------ 落地 ------------------------------------ */
+
+/* 更新 payload\（必要时同步游戏目录）。不做回滚。 */
+static BOOL upd_apply(const UpdInfo* u, const wchar_t* gameRoot, OpResult* r)
+{
+    wchar_t tmp[MAX_PATH * 2], err[256], nameW[128];
+    wchar_t verW[64];
+    int i;
+
+    if (!u->nf) {
+        op_append(r, L"  这份清单里没有文件信息（走的是 GitHub API 退路）。");
+        op_append(r, L"  请到项目页手动下载：https://github.com/%s/%s/releases", UPD_USERW, UPD_REPOW);
+        ++r->failed;
+        return FALSE;
+    }
+
+    wsprintfW(tmp, L"%s\\_tmp", g_payloadDir);
+    if (!dexists(tmp) && !CreateDirectoryW(tmp, NULL)) {
+        op_append(r, L"  无法创建临时目录：%s", tmp);
+        ++r->failed;
+        return FALSE;
+    }
+
+    /* ① 全部下载 + 校验（此阶段不动任何现有文件） */
+    for (i = 0; i < u->nf; ++i) {
+        wchar_t dst[MAX_PATH * 2];
+        wchar_t num[32];
+        u8_to_w(u->f[i].name, -1, nameW, 128);
+        wsprintfW(dst, L"%s\\%s", tmp, nameW);
+        if (!upd_get_one(u->tag, &u->f[i], dst, err, 256)) {
+            op_append(r, L"  %s 下载失败：%s", nameW, err);
+            ++r->failed;
+            return FALSE;
+        }
+        commafy(fsize(dst), num);
+        op_append(r, L"  %s 已下载并校验通过（%s 字节）", nameW, num);
+    }
+
+    /* ② 替换 payload\ */
+    for (i = 0; i < u->nf; ++i) {
+        wchar_t s[MAX_PATH * 2], d[MAX_PATH * 2];
+        u8_to_w(u->f[i].name, -1, nameW, 128);
+        wsprintfW(s, L"%s\\%s", tmp, nameW);
+        wsprintfW(d, L"%s\\%s", g_payloadDir, nameW);
+        if (!MoveFileExW(s, d, MOVEFILE_REPLACE_EXISTING)) {
+            op_append(r, L"  写入 payload 失败：%s（错误码 %u）", nameW, (unsigned)GetLastError());
+            ++r->failed;
+        }
+    }
+    if (r->failed) return FALSE;
+
+    /* ③ 把清单原文写成新的本地版本标记 */
+    if (u->rawLen > 0) {
+        wchar_t p[MAX_PATH * 2];
+        HANDLE h;
+        wsprintfW(p, L"%s\\%s", g_payloadDir, UPD_MANIFW);
+        h = CreateFileW(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD w = 0;
+            WriteFile(h, u->raw, (DWORD)u->rawLen, &w, NULL);
+            CloseHandle(h);
+        }
+    }
+
+    /* ④ 旧的 version.txt 退役 */
+    {
+        wchar_t p[MAX_PATH * 2];
+        wsprintfW(p, L"%s\\version.txt", g_payloadDir);
+        if (fexists(p)) DeleteFileW(p);
+    }
+
+    /* ⑤ 汉化已启用 → 同步游戏目录 */
+    if (game_ok(gameRoot)) {
+        wchar_t dstPak[MAX_PATH * 2], dstDll[MAX_PATH * 2], bk[MAX_PATH * 2];
+        wsprintfW(dstPak, L"%s\\Game\\Content\\Paks\\%s", gameRoot, PAK_NAME);
+        wsprintfW(dstDll, L"%s\\Game\\Binaries\\Win64\\%s", gameRoot, DLL_NAME);
+        wsprintfW(bk, L"%s\\_backup", g_exeDir);
+        if (fexists(dstPak) || fexists(dstDll)) {
+            wchar_t srcPak[MAX_PATH * 2], srcDll[MAX_PATH * 2];
+            wsprintfW(srcPak, L"%s\\%s", g_payloadDir, PAK_NAME);
+            wsprintfW(srcDll, L"%s\\%s", g_payloadDir, DLL_NAME);
+            op_append(r, L"  汉化已启用 → 同步更新游戏目录");
+            install_one(srcPak, dstPak, bk, r, L"译文包");
+            install_one(srcDll, dstDll, bk, r, L"代理 DLL");
+        } else {
+            op_append(r, L"  汉化尚未启用，下次点「启用汉化」即可用上新版");
+        }
+    }
+
+    /* ⑥ 清理临时目录 */
+    for (i = 0; i < u->nf; ++i) {
+        wchar_t s[MAX_PATH * 2];
+        u8_to_w(u->f[i].name, -1, nameW, 128);
+        wsprintfW(s, L"%s\\%s", tmp, nameW);
+        DeleteFileW(s);
+    }
+    RemoveDirectoryW(tmp);
+
+    u8_to_w(u->ver, -1, verW, 64);
+    op_append(r, L"完成，现在是 %s。", verW);
+    return r->failed == 0;
 }
 
 /* --------------------------- 图形界面 ----------------------------------- */
@@ -702,6 +1308,11 @@ static HWND mk_edit(HWND p, int id, int x, int y, int w, int h, DWORD extra, BOO
     return c;
 }
 
+/* 底部提示的默认文案（检查更新期间会临时改写，事后恢复） */
+static const wchar_t kHintDefault[] =
+    L"用法：先「启用汉化」，再「启动游戏」。「停用汉化」会移除汉化文件，官方文件不受影响。"
+    L"仅限离线单人游玩，请勿用于多人模式。";
+
 static void ui_build(HWND hwnd)
 {
     HWND h;
@@ -723,11 +1334,9 @@ static void ui_build(HWND hwnd)
     mk_btn(hwnd, L"启动游戏", IDC_LAUNCH, 256, 442, 110, 34);
     mk_btn(hwnd, L"刷新状态", IDC_REFRESH, 376, 442, 110, 34);
     mk_btn(hwnd, L"打开游戏目录", IDC_OPENFOLDER, 496, 442, 130, 34);
+    mk_btn(hwnd, L"检查更新", IDC_UPDATE, 640, 442, 124, 34);
 
-    g_hHint = mk_static(hwnd,
-        L"用法：先「启用汉化」，再「启动游戏」。「停用汉化」会移除汉化文件，官方文件不受影响。"
-        L"仅限离线单人游玩，请勿用于多人模式。",
-        0, 16, 486, 748, 40);
+    g_hHint = mk_static(hwnd, kHintDefault, 0, 16, 486, 748, 40);
 
     (void)h; (void)CW; (void)CH;
 }
@@ -882,6 +1491,46 @@ static void ui_browse(HWND hwnd)
     }
 }
 
+/* ------------------- 检查更新（后台线程，不卡界面） --------------------- */
+
+static volatile LONG g_updBusy = 0;
+static BOOL     g_updAuto = FALSE;      /* 本次是不是启动时的静默检查 */
+static int      g_updRc = 0;
+static wchar_t  g_updGame[MAX_PATH];
+static UpdInfo  g_updInfo;
+static OpResult g_updLog;
+static OpResult g_updApplyR;
+
+static DWORD WINAPI upd_check_thread(LPVOID p)
+{
+    (void)p;
+    g_updRc = upd_check(&g_updInfo, &g_updLog);
+    PostMessageW(g_hMain, WM_APP_UPDDONE, 0, 0);
+    return 0;
+}
+
+static DWORD WINAPI upd_apply_thread(LPVOID p)
+{
+    wchar_t vw[64];
+    (void)p;
+    ZeroMemory(&g_updApplyR, sizeof(g_updApplyR));
+    u8_to_w(g_updInfo.ver, -1, vw, 64);
+    op_append(&g_updApplyR, L"更新到 %s", vw);
+    upd_apply(&g_updInfo, g_updGame, &g_updApplyR);
+    PostMessageW(g_hMain, WM_APP_APPLYDONE, 0, 0);
+    return 0;
+}
+
+/* autoCheck=TRUE 时静默：只有发现新版才弹窗，已最新或检查失败都不打扰 */
+static void upd_start_check(BOOL autoCheck)
+{
+    if (InterlockedCompareExchange(&g_updBusy, 1, 0) != 0) return;
+    g_updAuto = autoCheck;
+    GetWindowTextW(g_hPath, g_updGame, MAX_PATH);
+    if (!autoCheck) SetWindowTextW(g_hHint, L"正在检查更新…");
+    CloseHandle(CreateThread(NULL, 0, upd_check_thread, NULL, 0, NULL));
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -893,11 +1542,65 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             else SetWindowTextW(g_hPath, g_gameRoot);
         }
         ui_refresh(hwnd);
+        SetTimer(hwnd, IDT_AUTOCHECK, 1200, NULL);   /* 启动 1.2 秒后静默查一次 */
+        return 0;
+
+    case WM_TIMER:
+        if (wp == IDT_AUTOCHECK) {
+            KillTimer(hwnd, IDT_AUTOCHECK);
+            upd_start_check(TRUE);
+        }
+        return 0;
+
+    case WM_APP_UPDDONE: {
+        int rc = g_updRc;
+        InterlockedExchange(&g_updBusy, 0);
+        SetWindowTextW(g_hHint, kHintDefault);
+        if (rc == 2) {
+            static wchar_t vw[64], lw[64], nw[2560], msg[6144];
+            u8_to_w(g_updInfo.ver, -1, vw, 64);
+            u8_to_w(g_updInfo.localVer, -1, lw, 64);
+            u8_to_w(g_updInfo.notes, -1, nw, 2560);
+            wsprintfW(msg,
+                L"发现新版本：%s      当前版本：%s\r\n\r\n%s\r\n\r\n"
+                L"是否现在下载并更新？\r\n"
+                L"（更新译文包与代理 DLL；汉化已启用时，游戏目录里的文件会一并更新）",
+                vw, lw[0] ? lw : L"未知", nw[0] ? nw : L"本次发布没有写更新说明");
+            if (MessageBoxW(hwnd, msg, APP_TITLE, MB_ICONQUESTION | MB_YESNO) == IDYES) {
+                if (InterlockedCompareExchange(&g_updBusy, 1, 0) == 0) {
+                    SetWindowTextW(g_hHint, L"正在下载更新…请稍候");
+                    CloseHandle(CreateThread(NULL, 0, upd_apply_thread, NULL, 0, NULL));
+                }
+            }
+        } else if (rc == 1) {
+            if (!g_updAuto) {
+                static wchar_t lw[64], msg[512];
+                u8_to_w(g_updInfo.localVer, -1, lw, 64);
+                wsprintfW(msg, L"已是最新版本（%s）。", lw[0] ? lw : L"未知");
+                MessageBoxW(hwnd, msg, APP_TITLE, MB_ICONINFORMATION | MB_OK);
+            }
+        } else {
+            if (!g_updAuto) {
+                static wchar_t msg[8192];
+                lstrcpynW(msg, L"检查更新失败 —— 连不上更新源。\r\n\r\n", 8192);
+                if ((int)wcslen(msg) + (int)wcslen(g_updLog.msg) < 8000) lstrcatW(msg, g_updLog.msg);
+                lstrcatW(msg, L"\r\n稍后重试，或到项目页手动下载。");
+                MessageBoxW(hwnd, msg, APP_TITLE, MB_ICONWARNING | MB_OK);
+            }
+        }
+        return 0;
+    }
+
+    case WM_APP_APPLYDONE:
+        InterlockedExchange(&g_updBusy, 0);
+        SetWindowTextW(g_hHint, kHintDefault);
+        ui_op_result(hwnd, &g_updApplyR);
         return 0;
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDC_BROWSE:  ui_browse(hwnd); return 0;
+        case IDC_UPDATE:  upd_start_check(FALSE); return 0;
         case IDC_REFRESH: ui_refresh(hwnd); return 0;
         case IDC_OPENFOLDER: {
             wchar_t t[MAX_PATH];
@@ -1071,6 +1774,47 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
             do_disable(root, &r);
             out_init(); out_line(r.msg);
             return r.failed ? 1 : 0;
+        }
+        if (lstrcmpiW(mode, L"check") == 0) {
+            UpdInfo u; OpResult lg;
+            int rc;
+            wchar_t lw[64], rw[64];
+            out_init();
+            rc = upd_check(&u, &lg);
+            out_line(L"--- 更新检查 ---");
+            out_multiline(lg.msg);
+            if (rc == 0) { out_line(L"结果：检查失败"); return 1; }
+            u8_to_w(u.localVer, -1, lw, 64);
+            u8_to_w(u.ver, -1, rw, 64);
+            out_line2(L"本地版本：%s", lw[0] ? lw : L"（未知）");
+            out_line2(L"远程版本：%s", rw);
+            if (rc == 1) { out_line(L"结果：已是最新"); return 0; }
+            out_line(L"结果：有新版本");
+            if (u.notes[0]) { wchar_t nw[2048]; out_line(L""); u8_to_w(u.notes, -1, nw, 2048); out_multiline(nw); }
+            return 3;
+        }
+        if (lstrcmpiW(mode, L"update") == 0) {
+            UpdInfo u; OpResult lg, r2;
+            int rc;
+            wchar_t lw[64], rw[64];
+            out_init();
+            rc = upd_check(&u, &lg);
+            out_multiline(lg.msg);
+            u8_to_w(u.localVer, -1, lw, 64);
+            u8_to_w(u.ver, -1, rw, 64);
+            if (rc == 1) { out_line(L"已是最新，无需更新。"); return 0; }
+            if (rc == 0) { out_line(L"检查更新失败。"); return 1; }
+            out_line2(L"更新：%s → %s", lw[0] ? lw : L"（未知）", rw);
+            ZeroMemory(&r2, sizeof(r2));
+            {
+                wchar_t vw[64];
+                u8_to_w(u.ver, -1, vw, 64);
+                op_append(&r2, L"更新到 %s", vw);
+            }
+            upd_apply(&u, root, &r2);
+            out_line(L"");
+            out_multiline(r2.msg);
+            return r2.failed ? 1 : 0;
         }
         if (lstrcmpiW(mode, L"launch") == 0) {
             do_launch(root, &r);
