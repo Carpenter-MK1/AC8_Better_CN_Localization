@@ -1135,6 +1135,19 @@ static BOOL upd_get_one(const wchar_t* tag, const UpdFile* f, const wchar_t* dst
 
 /* ------------------------------ 落地 ------------------------------------ */
 
+/* 清掉下载临时目录 —— 成功或失败都要清，别把半个包留在 payload 里 */
+static void upd_clean_tmp(const UpdInfo* u, const wchar_t* tmp)
+{
+    int i;
+    wchar_t nameW[128], s[MAX_PATH * 2];
+    for (i = 0; i < u->nf; ++i) {
+        u8_to_w(u->f[i].name, -1, nameW, 128);
+        wsprintfW(s, L"%s\\%s", tmp, nameW);
+        DeleteFileW(s);
+    }
+    RemoveDirectoryW(tmp);
+}
+
 /* 更新 payload\（必要时同步游戏目录）。不做回滚。 */
 static BOOL upd_apply(const UpdInfo* u, const wchar_t* gameRoot, OpResult* r)
 {
@@ -1165,6 +1178,7 @@ static BOOL upd_apply(const UpdInfo* u, const wchar_t* gameRoot, OpResult* r)
         if (!upd_get_one(u->tag, &u->f[i], dst, err, 256)) {
             op_append(r, L"  %s 下载失败：%s", nameW, err);
             ++r->failed;
+            upd_clean_tmp(u, tmp);
             return FALSE;
         }
         commafy(fsize(dst), num);
@@ -1182,7 +1196,7 @@ static BOOL upd_apply(const UpdInfo* u, const wchar_t* gameRoot, OpResult* r)
             ++r->failed;
         }
     }
-    if (r->failed) return FALSE;
+    if (r->failed) { upd_clean_tmp(u, tmp); return FALSE; }
 
     /* ③ 把清单原文写成新的本地版本标记 */
     if (u->rawLen > 0) {
@@ -1223,13 +1237,7 @@ static BOOL upd_apply(const UpdInfo* u, const wchar_t* gameRoot, OpResult* r)
     }
 
     /* ⑥ 清理临时目录 */
-    for (i = 0; i < u->nf; ++i) {
-        wchar_t s[MAX_PATH * 2];
-        u8_to_w(u->f[i].name, -1, nameW, 128);
-        wsprintfW(s, L"%s\\%s", tmp, nameW);
-        DeleteFileW(s);
-    }
-    RemoveDirectoryW(tmp);
+    upd_clean_tmp(u, tmp);
 
     u8_to_w(u->ver, -1, verW, 64);
     op_append(r, L"完成，现在是 %s。", verW);
