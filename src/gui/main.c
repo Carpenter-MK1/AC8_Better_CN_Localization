@@ -9,8 +9,9 @@
  *    ③ 按需启动游戏（走 Steam，实测不带任何参数也能加载汉化）
  *    ④ 状态自检：汉化包（含构建时间）、代理 DLL、游戏版本适配、上次运行加载情况
  *    ⑤ 首次「启用汉化」弹「使用前须知」：免责声明 + 多人模式封号警告（红字），须停留 3 秒才可确认
- *    ⑥ 检查更新：读仓库里的 dist/version.json，比对后下载并校验（size + sha256）
- *       新的「汉化包 + 注入包」；启动时自动查一次（静默，只有发现新版才提示）
+ *    ⑥ 检查更新：先问 GitHub API 要最新 release 的 tag（活接口，不受 CDN 缓存影响），
+ *       再按该 tag 取 dist/version.json（tag 内容不可变）→ 数值比对版本 → 下载并校验
+ *       （size + sha256）新的「汉化包 + 注入包」；启动时自动查一次（静默，只有发现新版才提示）
  *
  *  也支持命令行（脚本/自动化友好）：
  *    AC8汉化管理器.exe status | enable | disable | launch | check | update | help
@@ -35,7 +36,7 @@
 /* ------------------------------- 常量 ----------------------------------- */
 
 #define APP_TITLE    L"ACE COMBAT 8 · 简体汉化管理器"
-#define APP_VER      L"1.3"
+#define APP_VER      L"1.4"
 
 #define PAK_NAME     L"pakchunk0-Windows_998_P.pak"
 #define DLL_NAME     L"dinput8.dll"
@@ -1005,67 +1006,138 @@ static BOOL upd_parse_manifest(const char* js, int len, UpdInfo* u)
 }
 
 /* ------------------------------ 取远程清单 ------------------------------ */
+/* 逐段数值比较版本号：a>b → 1，a<b → -1，相等 → 0。
+ * 例：2026.10.11.4 > 2026.10.11.3 > 2026.10.11。任一段不是纯数字则退回字符串比较。 */
+static int ver_cmp(const char* a, const char* b)
+{
+    const char* pa = a;
+    const char* pb = b;
+    for (;;) {
+        unsigned long va = 0, vb = 0;
+        int na = 0, nb = 0, c;
+        while (*pa >= '0' && *pa <= '9') { va = va * 10 + (unsigned long)(*pa - '0'); ++pa; ++na; }
+        while (*pb >= '0' && *pb <= '9') { vb = vb * 10 + (unsigned long)(*pb - '0'); ++pb; ++nb; }
+        if (!na || !nb) {
+            c = lstrcmpA(a, b);
+            return c < 0 ? -1 : (c > 0 ? 1 : 0);
+        }
+        if (va != vb) return (va > vb) ? 1 : -1;
+        if (*pa == '.' && *pb == '.') { ++pa; ++pb; continue; }
+        if (*pa == '.') return 1;                 /* a 段数更多 → a 更新 */
+        if (*pb == '.') return -1;
+        if (!*pa && !*pb) return 0;
+        c = lstrcmpA(pa, pb);
+        return c < 0 ? -1 : (c > 0 ? 1 : 0);
+    }
+}
 
-static BOOL upd_fetch_remote(UpdInfo* u, OpResult* log)
+/* 从指定 tag 的 dist/version.json 取清单。
+ * ★ 一定要按 tag 取：tag 指向的提交内容不可变，不会被 CDN 缓存坑到。 */
+static BOOL upd_fetch_at_tag(const wchar_t* tag, UpdInfo* u)
 {
     static char js[64 * 1024];
-    int n = 0, i;
-    wchar_t err[256], tmp[300];
-    static const wchar_t* kMan[] = {
-        L"https://raw.githubusercontent.com/" UPD_USERW L"/" UPD_REPOW L"/main/dist/" UPD_MANIFW,
-        L"https://gcore.jsdelivr.net/gh/" UPD_USERW L"/" UPD_REPOW L"@main/dist/" UPD_MANIFW,
-        L"https://cdn.jsdelivr.net/gh/" UPD_USERW L"/" UPD_REPOW L"@main/dist/" UPD_MANIFW,
+    static const wchar_t* kFmt[UPD_NSRC] = {
+        L"https://raw.githubusercontent.com/" UPD_USERW L"/" UPD_REPOW L"/%s/dist/" UPD_MANIFW,
+        L"https://gcore.jsdelivr.net/gh/" UPD_USERW L"/" UPD_REPOW L"@%s/dist/" UPD_MANIFW,
+        L"https://cdn.jsdelivr.net/gh/" UPD_USERW L"/" UPD_REPOW L"@%s/dist/" UPD_MANIFW,
     };
-
-    for (i = 0; i < 3; ++i) {
-        if (!http_get(kMan[i], js, (int)sizeof(js), &n, INVALID_HANDLE_VALUE, err, 256) || n <= 0) {
-            werr(tmp, 300, L"%s", err);
-            op_append(log, L"  清单源 %d 失败：%s", i + 1, tmp);
-            continue;
-        }
-        if (upd_parse_manifest(js, n, u)) {
-            op_append(log, L"  清单源 %d：%s（%d 个文件）", i + 1, u->tag, u->nf);
-            u->haveRemote = TRUE;
-            return TRUE;
-        }
-        op_append(log, L"  清单源 %d 内容无法解析，换下一个", i + 1);
-    }
-
-    /* 退路：GitHub API —— 只能拿到版本号，下载不了（files 为空） */
-    {
-        wchar_t url[512];
-        wsprintfW(url, L"https://api.github.com/repos/%s/%s/releases/latest", UPD_USERW, UPD_REPOW);
-        if (http_get(url, js, (int)sizeof(js), &n, INVALID_HANDLE_VALUE, err, 256) && n > 0) {
-            char tag[80];
-            if (jget_s(js, n, "tag_name", tag, 80) && tag[0]) {
-                const char* q = tag;
-                if (*q == 'v' || *q == 'V') ++q;
-                lstrcpynA(u->ver, q, 64);
-                u8_to_w(tag, -1, u->tag, 80);
-                if (jget_s(js, n, "body", u->notes, 2048)) { /* 直接用 */ }
-                u->nf = 0;
-                op_append(log, L"  退路 GitHub API：%s（仅版本号，无法直接下载）", u->tag);
-                u->haveRemote = TRUE;
-                return TRUE;
-            }
-        }
-        werr(tmp, 300, L"%s", err);
-        op_append(log, L"  GitHub API 也失败：%s", tmp);
+    int i, n;
+    wchar_t url[1024], err[256];
+    for (i = 0; i < UPD_NSRC; ++i) {
+        wsprintfW(url, kFmt[i], tag);
+        n = 0;
+        if (!http_get(url, js, (int)sizeof(js), &n, INVALID_HANDLE_VALUE, err, 256) || n <= 0) continue;
+        if (upd_parse_manifest(js, n, u)) return TRUE;
     }
     return FALSE;
 }
 
-/* 返回 0=检查失败 1=已最新 2=有新版 */
+/* 从 main 分支的 dist/version.json 取清单（raw 有 3~5 分钟 CDN 缓存，只作退路） */
+static BOOL upd_fetch_at_main(UpdInfo* u, OpResult* log)
+{
+    static char js[64 * 1024];
+    static const wchar_t* kMan[UPD_NSRC] = {
+        L"https://raw.githubusercontent.com/" UPD_USERW L"/" UPD_REPOW L"/main/dist/" UPD_MANIFW,
+        L"https://gcore.jsdelivr.net/gh/" UPD_USERW L"/" UPD_REPOW L"@main/dist/" UPD_MANIFW,
+        L"https://cdn.jsdelivr.net/gh/" UPD_USERW L"/" UPD_REPOW L"@main/dist/" UPD_MANIFW,
+    };
+    int i, n;
+    wchar_t err[256], tmp[300];
+    for (i = 0; i < UPD_NSRC; ++i) {
+        n = 0;
+        if (!http_get(kMan[i], js, (int)sizeof(js), &n, INVALID_HANDLE_VALUE, err, 256) || n <= 0) {
+            werr(tmp, 300, L"%s", err);
+            op_append(log, L"  main 清单源 %d 失败：%s", i + 1, tmp);
+            continue;
+        }
+        if (upd_parse_manifest(js, n, u)) {
+            op_append(log, L"  main 清单源 %d：%s（注意可能有几分钟缓存）", i + 1, u->tag);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* 取远程最新版本。
+ * ① 先问 GitHub API 要「最新 release 的 tag」—— 这是活接口，不受 CDN 缓存影响；
+ * ② 再按那个 tag 取清单（tag 内容不可变，所以绝不会读到旧的）；
+ * ③ API 不通才退回读 main 分支的清单（可能陈旧几分钟）。 */
+static BOOL upd_fetch_remote(UpdInfo* u, OpResult* log)
+{
+    static char js[64 * 1024];
+    int n = 0;
+    wchar_t url[512], err[256], tmp[300];
+    char tag[80];
+
+    wsprintfW(url, L"https://api.github.com/repos/%s/%s/releases/latest", UPD_USERW, UPD_REPOW);
+    if (http_get(url, js, (int)sizeof(js), &n, INVALID_HANDLE_VALUE, err, 256) && n > 0) {
+        if (jget_s(js, n, "tag_name", tag, 80) && tag[0]) {
+            wchar_t tagW[80];
+            u8_to_w(tag, -1, tagW, 80);
+            op_append(log, L"  最新 release：%s（GitHub API）", tagW);
+            if (upd_fetch_at_tag(tagW, u)) {
+                op_append(log, L"  清单取自 %s：%d 个文件", u->tag, u->nf);
+                u->haveRemote = TRUE;
+                return TRUE;
+            }
+            {
+                const char* q = tag;
+                if (*q == 'v' || *q == 'V') ++q;
+                lstrcpynA(u->ver, q, 64);
+                lstrcpynW(u->tag, tagW, 80);
+                u->nf = 0;
+                op_append(log, L"  ⚠ 该 tag 上取不到清单，只能提示版本、无法自动下载");
+                u->haveRemote = TRUE;
+                return TRUE;
+            }
+        }
+        werr(err, 256, L"API 响应里没有 tag_name");
+    }
+    werr(tmp, 300, L"%s", err);
+    op_append(log, L"  GitHub API 不可用（%s），退回读 main 清单", tmp);
+
+    if (upd_fetch_at_main(u, log)) {
+        u->haveRemote = TRUE;
+        return TRUE;
+    }
+    op_append(log, L"  所有更新源都不可用");
+    return FALSE;
+}
+
+/* 返回 0=检查失败  1=已最新  2=线上有新版  3=本地比线上新 */
 static int upd_check(UpdInfo* u, OpResult* log)
 {
+    int c;
     ZeroMemory(u, sizeof(*u));
     ZeroMemory(log, sizeof(*log));
     upd_local_read(u);
     if (!upd_fetch_remote(u, log)) return 0;
-    if (!u->localVer[0]) return 2;
-    return (strcmp(u->localVer, u->ver) == 0) ? 1 : 2;
+    if (!u->localVer[0]) return 2;              /* 本地没有版本信息 → 当作需要更新 */
+    c = ver_cmp(u->ver, u->localVer);
+    if (c == 0) return 1;
+    if (c > 0)  return 2;
+    return 3;
 }
-
 /* ------------------------------ 下载并校验 ------------------------------ */
 
 static void upd_build_url(const wchar_t* tag, const wchar_t* name, int src,
@@ -1316,10 +1388,19 @@ static HWND mk_edit(HWND p, int id, int x, int y, int w, int h, DWORD extra, BOO
     return c;
 }
 
-/* 底部提示的默认文案（检查更新期间会临时改写，事后恢复） */
-static const wchar_t kHintDefault[] =
-    L"用法：先「启用汉化」，再「启动游戏」。「停用汉化」会移除汉化文件，官方文件不受影响。"
-    L"仅限离线单人游玩，请勿用于多人模式。";
+/* 底部提示：第一行固定用法，第二行显示最近一次更新检查的结果 ——
+ * 这样"有没有真的查过"一眼可见，不用猜。 */
+static const wchar_t kHintL1[] =
+    L"用法：先「启用汉化」，再「启动游戏」。仅限离线单人游玩，请勿用于多人模式。";
+static wchar_t g_updLast[320] = L"尚未检查";
+
+static void hint_show(const wchar_t* line2)
+{
+    wchar_t t[800];
+    if (line2) lstrcpynW(g_updLast, line2, 320);
+    wsprintfW(t, L"%s\r\n更新检查：%s", kHintL1, g_updLast);
+    SetWindowTextW(g_hHint, t);
+}
 
 static void ui_build(HWND hwnd)
 {
@@ -1344,7 +1425,8 @@ static void ui_build(HWND hwnd)
     mk_btn(hwnd, L"打开游戏目录", IDC_OPENFOLDER, 496, 442, 130, 34);
     mk_btn(hwnd, L"检查更新", IDC_UPDATE, 640, 442, 124, 34);
 
-    g_hHint = mk_static(hwnd, kHintDefault, 0, 16, 486, 748, 40);
+    g_hHint = mk_static(hwnd, L"", 0, 16, 486, 748, 40);
+    hint_show(NULL);
 
     (void)h; (void)CW; (void)CH;
 }
@@ -1535,7 +1617,7 @@ static void upd_start_check(BOOL autoCheck)
     if (InterlockedCompareExchange(&g_updBusy, 1, 0) != 0) return;
     g_updAuto = autoCheck;
     GetWindowTextW(g_hPath, g_updGame, MAX_PATH);
-    if (!autoCheck) SetWindowTextW(g_hHint, L"正在检查更新…");
+    if (!autoCheck) hint_show(L"正在检查…");
     CloseHandle(CreateThread(NULL, 0, upd_check_thread, NULL, 0, NULL));
 }
 
@@ -1562,13 +1644,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_APP_UPDDONE: {
         int rc = g_updRc;
+        static wchar_t vw[64], lw[64], nw[2560], msg[6144], last[320];
         InterlockedExchange(&g_updBusy, 0);
-        SetWindowTextW(g_hHint, kHintDefault);
+        u8_to_w(g_updInfo.ver, -1, vw, 64);
+        u8_to_w(g_updInfo.localVer, -1, lw, 64);
+        u8_to_w(g_updInfo.notes, -1, nw, 2560);
+
         if (rc == 2) {
-            static wchar_t vw[64], lw[64], nw[2560], msg[6144];
-            u8_to_w(g_updInfo.ver, -1, vw, 64);
-            u8_to_w(g_updInfo.localVer, -1, lw, 64);
-            u8_to_w(g_updInfo.notes, -1, nw, 2560);
+            wsprintfW(last, L"发现新版 %s（当前 %s）", vw, lw[0] ? lw : L"未知");
+            hint_show(last);
             wsprintfW(msg,
                 L"发现新版本：%s      当前版本：%s\r\n\r\n%s\r\n\r\n"
                 L"是否现在下载并更新？\r\n"
@@ -1576,24 +1660,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 vw, lw[0] ? lw : L"未知", nw[0] ? nw : L"本次发布没有写更新说明");
             if (MessageBoxW(hwnd, msg, APP_TITLE, MB_ICONQUESTION | MB_YESNO) == IDYES) {
                 if (InterlockedCompareExchange(&g_updBusy, 1, 0) == 0) {
-                    SetWindowTextW(g_hHint, L"正在下载更新…请稍候");
+                    hint_show(L"正在下载更新…请稍候");
                     CloseHandle(CreateThread(NULL, 0, upd_apply_thread, NULL, 0, NULL));
                 }
             }
         } else if (rc == 1) {
-            if (!g_updAuto) {
-                static wchar_t lw[64], msg[512];
-                u8_to_w(g_updInfo.localVer, -1, lw, 64);
-                wsprintfW(msg, L"已是最新版本（%s）。", lw[0] ? lw : L"未知");
-                MessageBoxW(hwnd, msg, APP_TITLE, MB_ICONINFORMATION | MB_OK);
-            }
+            wsprintfW(last, L"已是最新（本机 %s = 线上 %s）", lw[0] ? lw : L"未知", vw);
+            hint_show(last);
+            if (!g_updAuto) MessageBoxW(hwnd, last, APP_TITLE, MB_ICONINFORMATION | MB_OK);
+        } else if (rc == 3) {
+            wsprintfW(last, L"本机比线上新（本机 %s > 线上 %s），无需更新", lw, vw);
+            hint_show(last);
+            if (!g_updAuto) MessageBoxW(hwnd, last, APP_TITLE, MB_ICONINFORMATION | MB_OK);
         } else {
+            hint_show(L"检查失败（连不上更新源）");
             if (!g_updAuto) {
-                static wchar_t msg[8192];
-                lstrcpynW(msg, L"检查更新失败 —— 连不上更新源。\r\n\r\n", 8192);
-                if ((int)wcslen(msg) + (int)wcslen(g_updLog.msg) < 8000) lstrcatW(msg, g_updLog.msg);
-                lstrcatW(msg, L"\r\n稍后重试，或到项目页手动下载。");
-                MessageBoxW(hwnd, msg, APP_TITLE, MB_ICONWARNING | MB_OK);
+                static wchar_t m2[8192];
+                lstrcpynW(m2, L"检查更新失败 —— 连不上更新源。\r\n\r\n", 8192);
+                if ((int)wcslen(m2) + (int)wcslen(g_updLog.msg) < 8000) lstrcatW(m2, g_updLog.msg);
+                lstrcatW(m2, L"\r\n稍后重试，或到项目页手动下载。");
+                MessageBoxW(hwnd, m2, APP_TITLE, MB_ICONWARNING | MB_OK);
             }
         }
         return 0;
@@ -1601,7 +1687,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_APP_APPLYDONE:
         InterlockedExchange(&g_updBusy, 0);
-        SetWindowTextW(g_hHint, kHintDefault);
+        hint_show(NULL);
         ui_op_result(hwnd, &g_updApplyR);
         return 0;
 
@@ -1797,6 +1883,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
             out_line2(L"本地版本：%s", lw[0] ? lw : L"（未知）");
             out_line2(L"远程版本：%s", rw);
             if (rc == 1) { out_line(L"结果：已是最新"); return 0; }
+            if (rc == 3) { out_line(L"结果：本机比线上新，无需更新"); return 0; }
             out_line(L"结果：有新版本");
             if (u.notes[0]) { wchar_t nw[2048]; out_line(L""); u8_to_w(u.notes, -1, nw, 2048); out_multiline(nw); }
             return 3;
@@ -1811,6 +1898,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
             u8_to_w(u.localVer, -1, lw, 64);
             u8_to_w(u.ver, -1, rw, 64);
             if (rc == 1) { out_line(L"已是最新，无需更新。"); return 0; }
+            if (rc == 3) { out_line(L"本机比线上新，无需更新。"); return 0; }
             if (rc == 0) { out_line(L"检查更新失败。"); return 1; }
             out_line2(L"更新：%s → %s", lw[0] ? lw : L"（未知）", rw);
             ZeroMemory(&r2, sizeof(r2));
