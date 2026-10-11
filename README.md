@@ -21,26 +21,46 @@
 
 ## 下载与使用
 
-1. 到 [Releases](../../releases) 下载最新版压缩包，解压到任意位置（**不需要管理员权限**）
-2. 双击 `AC8汉化管理器.exe`
-3. 确认「游戏目录」正确（不对就点「浏览…」）
-4. 点「**启用汉化**」→ 点「**启动游戏**」
+1. 到 [Releases](../../releases) 下载 `AC8_CN_Manager_<版本>.zip`（当前 `AC8_CN_Manager_2026.10.11.zip`，约 583 KB）
+2. 解压到任意位置（**不需要管理员权限**）
+3. 双击 `AC8汉化管理器.exe`
+4. 确认「游戏目录」正确（不对就点「浏览…」）
+5. 点「**启用汉化**」→ 点「**启动游戏**」
 
 想恢复原版：点「**停用汉化**」即可移除汉化文件，**官方文件从头到尾不会被改动**。
 
-### 国内直连下载
+> 首次点「启用汉化」会弹一个**使用前须知**（免责声明 + 多人模式封号警告），**必须停留 3 秒**才能确认。
+> 发布包里**不包含**这个"已阅读"状态，所以每个使用者都会看到它。
 
-`github.com` 的网页端在国内经常打不开，但 **`raw.githubusercontent.com` 可以直连**：
+### 国内下载
 
-| 文件 | 直链 |
+GitHub 在国内**普遍直连不通**（2026-10 实测：`github.com` 与 `raw.githubusercontent.com` 均超时；
+`api.github.com` 通）。下面这些实测可用：
+
+| 源 | 可用性 | 说明 |
+|---|---|---|
+| **ghfast.top** | ✅ 实测可代下 Release 附件（21 秒） | 前缀式：`https://ghfast.top/<原 GitHub 地址>` |
+| **jsDelivr CDN** | ✅ 直连 2~3 秒 | `https://cdn.jsdelivr.net/gh/Carpenter-MK1/AC8_Better_CN_Localization@main/<仓库内路径>`（**只服务仓库内文件，不含 Release 附件**） |
+| `github.com` / `raw.githubusercontent.com` | ❌ 超时（有代理/VPN 才通） | — |
+
+**下载整合包**（国内可用地址）：
+
+```
+https://ghfast.top/https://github.com/Carpenter-MK1/AC8_Better_CN_Localization/releases/download/v2026.10.11/AC8_CN_Manager_2026.10.11.zip
+```
+
+**只更新汉化内容**（老用户不必下整个 zip，从 `dist/` 直接取）：
+
+| 文件 | jsDelivr 直链 |
 |---|---|
-| 译文包 | `https://raw.githubusercontent.com/Carpenter-MK1/AC8_Better_CN_Localization/main/dist/pakchunk0-Windows_998_P.pak` |
-| 代理 DLL | `https://raw.githubusercontent.com/Carpenter-MK1/AC8_Better_CN_Localization/main/dist/dinput8.dll` |
-| 版本信息 | `https://raw.githubusercontent.com/Carpenter-MK1/AC8_Better_CN_Localization/main/dist/version.txt` |
+| 译文包 | `https://cdn.jsdelivr.net/gh/Carpenter-MK1/AC8_Better_CN_Localization@main/dist/pakchunk0-Windows_998_P.pak` |
+| 代理 DLL | `https://cdn.jsdelivr.net/gh/Carpenter-MK1/AC8_Better_CN_Localization@main/dist/dinput8.dll` |
+| 版本信息 | `https://cdn.jsdelivr.net/gh/Carpenter-MK1/AC8_Better_CN_Localization@main/dist/version.txt` |
 
-下载后放进管理器的 `payload\` 目录，再点「启用汉化」即可。
+下载后放进管理器的 `payload\` 目录（**文件名保持不变**），再点「启用汉化」即可。
 
-管理器里的【检查更新】就是读上面那个 `version.txt` 来比对版本的。
+> ⚠️ `ghfast.top`、`gh-proxy.com` 等是**第三方转发服务**，可用性与安全性均不由本项目保证。
+> 有条件时建议直连 GitHub 官方地址。
 
 ## 从源码构建
 
@@ -85,7 +105,7 @@ zig cc -o _test_match.exe _test_match.c && ./_test_match.exe
 ## 目录结构
 
 ```
-├── dist/            译文包与代理 DLL（供下载、以及「检查更新」比对）
+├── dist/            译文包与代理 DLL（供下载；后续「检查更新」也读这里）
 │   ├── pakchunk0-Windows_998_P.pak
 │   ├── dinput8.dll
 │   └── version.txt  版本号 + 本次更新说明
@@ -116,7 +136,7 @@ zig cc -o _test_match.exe _test_match.c && ./_test_match.exe
 > 本 DLL 只依赖 `kernel32`，**不含任何第三方二进制、不依赖 MinGW/CRT 运行时**。
 
 因为包名规则是**通配**而不是写死某一个名字，本工具可以与使用**其它包名**（例如 `pakchunk0-Windows_999_P.pak`）的
-mod **共存**。
+mod **共存**（包名规则已自测通过；游戏内与其它 mod 同时挂载**未实测**）。
 
 ## ⚠️ 免责声明与使用限制
 
