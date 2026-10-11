@@ -34,9 +34,9 @@
 
 | 文件 | 直链 |
 |---|---|
-| 译文包 | `https://raw.githubusercontent.com/Carpenter-MK1/ac8-hanhua-manager/main/dist/pakchunk0-Windows_998_P.pak` |
-| 代理 DLL | `https://raw.githubusercontent.com/Carpenter-MK1/ac8-hanhua-manager/main/dist/dinput8.dll` |
-| 版本信息 | `https://raw.githubusercontent.com/Carpenter-MK1/ac8-hanhua-manager/main/dist/version.txt` |
+| 译文包 | `https://raw.githubusercontent.com/Carpenter-MK1/AC8_Better_CN_Localization/main/dist/pakchunk0-Windows_998_P.pak` |
+| 代理 DLL | `https://raw.githubusercontent.com/Carpenter-MK1/AC8_Better_CN_Localization/main/dist/dinput8.dll` |
+| 版本信息 | `https://raw.githubusercontent.com/Carpenter-MK1/AC8_Better_CN_Localization/main/dist/version.txt` |
 
 下载后放进管理器的 `payload\` 目录，再点「启用汉化」即可。
 
