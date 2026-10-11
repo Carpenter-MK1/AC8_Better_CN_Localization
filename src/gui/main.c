@@ -345,7 +345,10 @@ static void probe_status(Status* s, const wchar_t* gameRoot, const wchar_t* iniP
     /* 上次启动日志 */
     wsprintfW(s->logPath, L"%s\\Game\\Binaries\\Win64\\%s", s->gameRoot, LOG_NAME);
     s->logOk = fexists(s->logPath);
-    if (s->logOk) s->logHit = file_has_marker(s->logPath, "PakCtor");
+    /* 判据：稳定的 ASCII 标记；也认旧日志里的中文文案（源码以 UTF-8 编译，字面量就是 UTF-8 字节）*/
+    if (s->logOk)
+        s->logHit = file_has_marker(s->logPath, "PAK-RELEASED-OK")
+                 || file_has_marker(s->logPath, "已放行补丁包");
 
     (void)iniPath;
 }

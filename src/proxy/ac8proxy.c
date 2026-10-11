@@ -173,7 +173,8 @@ unsigned char ac8_decide(const wchar_t* path, unsigned char bSigned)
     if (!path) return bSigned;
 
     if (is_mod_pak(path)) {
-        log_line("已放行补丁包（跳过签名校验）", 0, 0);
+        /* 末尾这个 ASCII 标记是给管理器认的判据（接口约定），改文案时别删 */
+        log_line("已放行补丁包（跳过签名校验） [PAK-RELEASED-OK]", 0, 0);
         log_flush();
         return 0;
     }
