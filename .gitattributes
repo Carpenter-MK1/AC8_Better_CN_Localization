@@ -1,0 +1,13 @@
+# 统一按 LF 存放。
+# 原因：src/*/build.sh 是要在 Git Bash / MSYS 下直接执行的，
+# 一旦被转成 CRLF，shebang 变成 "#!/bin/sh\r"，脚本会直接报解释器找不到。
+* text=auto eol=lf
+
+# Windows 资源文件（保留 CRLF 更自然）
+*.rc        text eol=crlf
+*.manifest  text eol=crlf
+
+# 二进制（将来若加入）
+*.pak  binary
+*.dll  binary
+*.exe  binary

@@ -1,0 +1,18 @@
+LIBRARY kernel32.dll
+EXPORTS
+  CreateFileW
+  WriteFile
+  FlushFileBuffers
+  CloseHandle
+  GetModuleHandleW
+  GetModuleFileNameW
+  DisableThreadLibraryCalls
+  VirtualAlloc
+  VirtualProtect
+  FlushInstructionCache
+  GetCurrentProcess
+  Sleep
+  LoadLibraryW
+  GetProcAddress
+  GetSystemDirectoryW
+  CreateThread
