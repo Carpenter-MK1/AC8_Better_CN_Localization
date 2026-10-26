@@ -1,6 +1,6 @@
 # ACE COMBAT 8 简体汉化管理器
 
-为《皇牌空战 8》补充简体中文文本的 Windows 工具。
+以英语文本为源重译《皇牌空战 8》简体中文文本的 Windows 工具。
 
 <a href="https://github.com/Carpenter-MK1/AC8_Better_CN_Localization/releases/latest"><img src="https://img.shields.io/github/v/release/Carpenter-MK1/AC8_Better_CN_Localization?label=version" alt="version"></a>
 <a href="https://github.com/Carpenter-MK1/AC8_Better_CN_Localization/releases"><img src="https://img.shields.io/github/downloads/Carpenter-MK1/AC8_Better_CN_Localization/total" alt="downloads"></a>
